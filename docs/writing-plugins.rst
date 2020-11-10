@@ -70,7 +70,7 @@ External plugin skeleton:
     extern "C"
     {
         PLUGIN_API IPlugin* create() { return new HelloWorldPlugin(); }
-        PLUGIN_API void destroy(IPlugin* p) { if (p) delete p; }
+        PLUGIN_API void destroy(IPlugin* p) { delete p; }
     };
 
     } //!namespace plugin
@@ -97,7 +97,8 @@ If you try to build the plugin right now, you'll see that the compiler is very a
             return boost::make_shared<std::string>("A sample plugin.");
         }
 
-        pResult analyze(const mana::PE& pe) override {
+        pResult analyze(const mana::PE& pe) override
+        {
             pResult res = create_result();
             res->add_information("Hello world from the plugin!");
             return res;
@@ -107,7 +108,7 @@ If you try to build the plugin right now, you'll see that the compiler is very a
 These functions serve the following purpose:
 
 * ``get_api_version``: the version of the API used by this plugin, in case it evolves and breaks retro-compatibility in the future. Just return 1 for now.
-* ``get_id``: the name of the plugin. This is how it will be refered to in the program's help and on the command-line; make sure to pick something unique!
+* ``get_id``: the name of the plugin. This is how it will be referred to in the program's help and on the command-line; make sure to pick something unique!
 * ``get_description``: a short explanation of what the plugin does. It is only printed when the user calls Manalyze with the ``--help`` option.
 * ``analyze``: performs the analysis of the program. We'll get back to this one very soon, for now, it just creates a result object containing a message.
 
@@ -251,7 +252,7 @@ Internally, all the result data is stored as key-value pairs; if you don't provi
 PE objects
 ==========
 
-Now that we know how to create results, we will look more closely at the ``analyze`` method. Here is how it's declared::
+Now that we know how to create results, we will look more closely at the ``analyze`` method. This is where you should write all your plugin's logic. Here is how it's declared::
 
     pResult analyze(const mana::PE& pe);
 
@@ -399,11 +400,20 @@ In Manalyze, looking up imports is a two-step process. You usually query the lis
         }
     }
 
-You can also use the ``find_imports`` function if you're looking for something specific. For instance::
+You can also use the ``find_imports`` and ``find_imported_dlls`` function if you're looking for something specific. For instance::
 
-    auto functions = pe.find_imports(".*basic_ostream.*", "MSVCP\\d{3}.dll|KERNEL32.dll");
+	auto dlls = pe.find_imports("WS2_32.dll", false);
+	
+...will return all shared libraries imported by the PE matching the regular expression given as the first argument. The second argument controls whether the regular expression is case sensitive and defaults to false when omitted.
+	
+    auto functions = pe.find_imports(".*basic_ostream.*", "MSVCP\\d{3}.dll|KERNEL32.dll", false);
 
-...where the first argument is a regular expression matching the functions to look for, and the second one is a regular expression matching the DLLs to search. You can omit the latter to look for the requested functions in any DLL.
+...where the first argument is a regular expression matching the functions to look for, the second one is a regular expression matching the DLLs to search, and the third one is whether the regular expression is case sensitive. 
+You can omit the latter two to look for the requested functions in any DLL with a case insensitive expression::
+
+    auto functions = pe.find_imports(".*bAsIc_OsTrEaM.*"); // Will search in any DLL, case insensitive
+	
+Finally, if you're interested in looking into the underlying structures, ``pe.get_imports`` returns ``ImportedLibrary`` objects which give direct access to the ``IMAGE_IMPORT_DESCRIPTOR`` and ``IMPORT_LOOKUP_TABLE``.
 
 Exports
 -------
@@ -470,12 +480,144 @@ The function returns a shared vector containing pointers to instances of the fol
         boost::uint32_t    PointerToRawData;
         std::string        Filename;
     } debug_directory_entry;
+	
+Thread Local Storage
+--------------------
 
+If TLS callbacks are defined in the binary, you can look them up with ``get_tls``::
+
+	auto ptls = pe.get_tls();
+	if (tls == nullptr) {
+		return; // No TLS callbacks or failed to parse them.
+	}
+	for (auto it = tls->Callbacks.begin() ; it != tls->Callbacks.end() ; ++it) {
+		std::cout << "Callback address: 0x" << std::hex << *it);
+	}
+	
+The object returned by this function is a pointer to an instance of the following structure::
+
+	typedef struct image_tls_directory_t
+	{
+		boost::uint64_t					StartAddressOfRawData;
+		boost::uint64_t					EndAddressOfRawData;
+		boost::uint64_t					AddressOfIndex;
+		boost::uint64_t					AddressOfCallbacks;
+		boost::uint32_t					SizeOfZeroFill;
+		boost::uint32_t					Characteristics;
+		std::vector<boost::uint64_t>			Callbacks; // Non-standard!
+	} image_tls_directory;
+	
+It closely resembles the original IMAGE_TLS_DIRECTORY structure, but with a list of all the callback addresses already parsed and stored in the ``Callbacks`` vector for your convinience.
+	
+Load Configuration
+------------------
+
+You can query the load configuration of the PE with the following function::
+
+	auto pconfig = pe.get_config();
+	if (pconfig != nullptr && config->SecurityCookie == 0) {
+		std::cout << "/GS seems to be disabled!" << std::endl;
+	}
+	
+The structure returned by this function mirrors the one defined in the `MSDN <https://msdn.microsoft.com/en-us/library/windows/hardware/ff549596(v=vs.85).aspx>`_::
+
+	typedef struct image_load_config_directory_t
+	{
+		boost::uint32_t	Size;
+		boost::uint32_t	TimeDateStamp;
+		boost::uint16_t	MajorVersion;
+		boost::uint16_t	MinorVersion;
+		boost::uint32_t GlobalFlagsClear;
+		boost::uint32_t GlobalFlagsSet;
+		boost::uint32_t CriticalSectionDefaultTimeout;
+		boost::uint64_t DeCommitFreeBlockThreshold;
+		boost::uint64_t DeCommitTotalFreeThreshold;
+		boost::uint64_t LockPrefixTable;
+		boost::uint64_t MaximumAllocationSize;
+		boost::uint64_t VirtualMemoryThreshold;
+		boost::uint64_t ProcessAffinityMask;
+		boost::uint32_t ProcessHeapFlags;
+		boost::uint16_t CSDVersion;
+		boost::uint16_t Reserved1;
+		boost::uint64_t EditList;
+		boost::uint64_t SecurityCookie;
+		boost::uint64_t SEHandlerTable;
+		boost::uint64_t SEHandlerCount;
+	} image_load_config_directory;
+	
+Delay Load Table
+----------------
+
+For PE files which have delayed imports, the ``DELAY_LOAD_DIRECTORY_TABLE`` can be retreived through ``get_delay_load_table``::
+
+	auto dldt = pe.get_delay_load_table();
+	if (dldt == nullptr) {
+		return; // No delayed imports.
+	}
+	std::cout << dldt->NameStr << " is delay-loaded!" << std::endl;
+
+The function returns a pointer to the following structure::
+
+	typedef struct delay_load_directory_table_t
+	{
+		boost::uint32_t Attributes;
+		boost::uint32_t Name;
+		boost::uint32_t ModuleHandle;
+		boost::uint32_t DelayImportAddressTable;
+		boost::uint32_t DelayImportNameTable;
+		boost::uint32_t BoundDelayImportTable;
+		boost::uint32_t UnloadDelayImportTable;
+		boost::uint32_t TimeStamp;
+		std::string		NameStr; // Non-standard!
+	} delay_load_directory_table;
+
+RICH Header
+-----------
+
+The RICH header can be can be obtained with the ``get_rich_header`` function::
+
+	auto rich = pe.get_rich_header();
+	if (rich == nullptr) {
+		return; // No RICH header.
+	}
+	std::cout << "XOR key: " << rich->xor_key << std::endl;
+	std::cout << "File offset: " << rich->file_offset << std::endl;
+	for (auto v : rich->values)	{
+		std::cout << "Type: " << std::get<0>(v) << " - Prodid: " << std::get<1>(v) << " - Count: " << std::get<2>(v) << std::endl;
+	}
+	
+As there is no official documentation for this structure, it is defined like this in Manalyze::
+
+	typedef struct rich_header_t
+	{
+		boost::uint32_t xor_key;
+		boost::uint32_t file_offset;
+		// Structure : id, product_id, count
+		std::vector<std::tuple<boost::uint16_t, boost::uint16_t, boost::uint32_t> > values;
+	} rich_header;
+
+The `file_offset` field is the absolute position in bytes of the structure in the file (usually ``0x80``). For more information regarding the origin of this structure and what information is contained in it, you can consult `this article <http://www.ntcore.com/files/richsign.htm>`_.
+	
 Miscellaneous
 -------------
 
 ``pe.get_filesize()`` returns the size of the input file in bytes.
 
+``pe.get_architecture()`` returns either ``PE::x86`` or ``PE::x64`` depending on the program's target architecture.
+
+``pe.rva_to_offset(boost::uint64_t rva)`` translates a relative virtual address into a file offset.
+
+``pe.get_raw_bytes(size_t size)`` returns the ``size`` first raw bytes of the file. If ``size`` is omitted, every byte from the file is returned::
+
+	auto bytes = pe.get_raw_bytes(1000);
+	for (auto it = bytes->begin() ; it != bytes->end() ; ++it) {
+		// Iterate on the bytes...
+	}
+	// Or access them directly:
+	if ((*bytes)[0] == 'M' && &(*bytes)[1] == 'Z') { ... }
+
+``pe.get_overlay_bytes(size_t size)`` returns the ``size`` first bytes of the overlay data of the PE. If ``size`` is omitted, every byte from the overlay data is returned; and if the file contains no such data, ``nullptr`` is returned.
+	
 ``nt::translate_to_flag`` and ``nt::translate_to_flags`` are two functions that come in handy when you need to expand flags (i.e. the ``Characteristics`` field of many structures). Use the first function for values which translate into a single flag, and the second one for values which are composed of multiple ones::
 
     auto pType = nt::translate_to_flag(ppe_header->Machine, nt::MACHINE_TYPES);
@@ -563,10 +705,12 @@ Most of the time, you'll want to look at the actual resource bytes. A ``get_raw_
 			return;
 		}
 		auto string_table = resource->interpret_as<const_shared_strings>();
-		std::cout << "Dumping a RT_STRING resource:" << std::endl;
+		std::wcout << L"Dumping a RT_STRING resource:" << std::endl;
 		for (auto it = string_table->begin() ; it != string_table->end() ; ++it) {
-			std::cout << *it << std::endl;
+			std::wcout << *it << std::endl;
 		}
+		
+	The strings returned are UTF-8 encoded.
 
 * ``pgroup_icon_directory`` for ``RT_GROUP_ICON`` and ``RT_GROUP_CURSOR``. Because of the way icons and cursors are stored in resources, an additional function ``reconstruct_icon`` was added to recreate a valid ICO file. Here is how you'd do it::
 
@@ -610,7 +754,44 @@ Utility functions are provided to extract resources into a file. Use `extract` o
 .. note:: What's up with all these pointers?
 	
 	Manalyze is built statically on Windows for a number of reasons which go beyond the scope of this documentation. This causes some issues when functions are called across DLLs, issues which can only be resolved through smart pointers ensuring that a module which allocated an object will be the one to free it. This ends up making all the interfaces a little more complex by having pointers everywhere.
+	
+Using the configuration file
+============================
 
+If you want to give users additional control on the plugin's behavior, you can let them pass arguments through the configuration file, ``manalyze.conf``. For instance, this mechanism is used to provide a VirusTotal API key without having to hard-code it into the software. Each plugin has access to a protected ``_config`` variable through its parent class. It is a simple map between strings. Here is an example of how it is used, taken from the packer detection plugin::
+
+	unsigned int min_imports;
+	// Check that a value was set in the configuration, otherwise use a default one.
+	if (_config == nullptr || !_config->count("min_imports")) {
+		min_imports = 10;
+	}
+	else
+	{
+		try {
+			min_imports = std::stoi(_config->at("min_imports"));
+		}
+		catch (std::invalid_argument) // In case someone writes "packer.min_imports = ABC"
+		{
+			PRINT_WARNING << "Could not parse packer.min_imports in the configuration file." << std::endl;
+			min_imports = 10;
+		}
+	}
+	
+Using variables from the configuration doesn't require any additional work: lines added to the configuration files are automatically parsed and provided to the target plugin. Let's assume you add the following lines to the configuration file::
+
+	helloworld.msg = Hello World!
+	# Lines starting with # are comments, the parser ignores them.
+	helloworld.val = 0
+	
+...then the ``_config`` variable of a plugin whose name (as reported by the ``get_id`` function) is ``helloworld`` would contain the following map::
+
+	{
+		"msg":	"Hello World!",
+		"val":	"0" // Careful! That's still a string!
+	}
+
+.. note:: The configuration is only initialized before calling the ``analyze`` method. This means that you won't be able to reference your plugin's configuration from its constructor.
+	
 Anything missing?
 =================
 

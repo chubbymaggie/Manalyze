@@ -22,6 +22,9 @@
 // TODO: Remove when Yara doesn't mask get_object anymore
 #undef get_object
 
+// Used to validate bitcoin addresses.
+#include "hash-library/cryptocurrency.h"
+
 #include "plugin_framework/plugin_interface.h"
 #include "plugin_framework/auto_register.h"
 
@@ -29,16 +32,53 @@ namespace plugin
 {
 
 
-
 // Provide a destructor for the structure sent to Yara.
 void delete_manape_module_data(manape_data* data)
 {
-    if (data != nullptr && data->sections != nullptr) {
+    if (data != nullptr) {
         free(data->sections);
     }
-    if (data != nullptr) {
-        delete data;
-    }
+	delete data;
+}
+
+// ----------------------------------------------------------------------------
+
+/**
+ *	@brief	A predicate which excludes strings found in PE regions created by
+ *			the compiler or Visual Studio.
+ *
+ *	Currently, this excludes both the authenticode signature and the 
+ *	RT_MANIFEST resource.
+ *
+ *	@param	pe The PE on which the Yara rule was run.
+ *	@param	m The structure representing the match to evaluate.
+ *
+ *	@return	Whether the match should be kept (true) or discarded (false).
+ */
+bool exclude_microsoft_data(const mana::PE& pe, yara::Match::pSingleMatch m)
+{
+	auto offset = m->get_offset();
+
+	const auto resources = pe.get_resources();
+	if (resources != nullptr)
+	{
+		// Exclude matches located in the authenticode section.
+		auto ioh = pe.get_image_optional_header();
+		if (ioh && 
+			ioh->directories[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress < offset &&
+			offset < static_cast<boost::uint64_t>(ioh->directories[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress) + ioh->directories[IMAGE_DIRECTORY_ENTRY_SECURITY].Size) {
+			return false;
+		}
+
+		for (auto& it : *resources)
+		{
+			// Exclude matches located inside the RT_MANIFEST
+			if (*it->get_type() == "RT_MANIFEST" && it->get_offset() < offset && offset < static_cast<boost::uint64_t>(it->get_offset()) + it->get_size()) {
+				return false;
+			}
+		}
+	}
+	return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -47,21 +87,27 @@ class YaraPlugin : public IPlugin
 {
 
 public:
-	YaraPlugin(const std::string& rule_file) : _rule_file(rule_file) {}
+	YaraPlugin(std::string rule_file) : _rule_file(std::move(rule_file)) {}
 
 	/**
 	 *	@brief	Helper function designed to generically prepare a result based on a Yara scan.
 	 *
-	 *	@param	const mana::PE& pe The PE to scan.
-	 *	const std::string& summary The summary to set if there is a match.
-	 *	Result::LEVEL level The threat level to set if there is a match.
-	 *	const std::string& meta_field_name The meta field name (of the yara rule) to query to
-	 *									   extract results.
-	 *	bool show_strings Adds the matched strings/patterns to the result.
+	 *	@param	pe The PE to scan.
+	 *	@param	summary The summary to set if there is a match.
+	 *	@param	level The threat level to set if there is a match.
+	 *	@param	meta_field_name The meta field name (of the yara rule) to query to
+	 *							extract results.
+	 *	@param	show_strings Adds the matched strings/patterns to the result.
+	 *	@param	callback A post-processing function to accept or reject matches.
 	 *
 	 *	@return	A pResult detailing the findings of the scan.
 	 */
-	pResult scan(const mana::PE& pe, const std::string& summary, LEVEL level, const std::string& meta_field_name, bool show_strings = false)
+	pResult scan(const mana::PE& pe, 
+				 const std::string& summary, 
+				 LEVEL level, 
+				 const std::string& meta_field_name,
+				 bool show_strings = false,
+				 bool (*callback)(const mana::PE&, yara::Match::pSingleMatch) = nullptr)
 	{
 		pResult res = create_result();
 		if (!_load_rules()) {
@@ -69,26 +115,54 @@ public:
 		}
 
 		yara::const_matches m = _engine.scan_file(*pe.get_path(), _create_manape_module_data(pe));
-		if (m && m->size() > 0)
+		if (m && !m->empty())
 		{
-			res->set_level(level);
-			res->set_summary(summary);
-			for (yara::match_vector::const_iterator it = m->begin() ; it != m->end() ; ++it)
+			bool found_valid = false;  // False as long as a valid string hasn't been found
+			for (const auto& it : *m)
 			{
-				if (!show_strings) {
-					res->add_information((*it)->operator[](meta_field_name));
+				// Filter matches based on the input predicate if one was given.
+				auto found = it->get_found_strings();
+				if (callback != nullptr)
+				{
+					std::vector<yara::Match::pSingleMatch> found_filtered;
+					for (const auto& single_match : found)
+					{
+						if (callback(pe, single_match)) {
+							found_filtered.push_back(single_match);
+						}
+					}
+					found = found_filtered;
+				}
+				if (found.empty()) {
+					continue;
+				}
+
+				found_valid = true;
+				if (!show_strings || (it->operator[]("show_strings") == "false")) {
+					res->add_information(it->operator[](meta_field_name));
 				}
 				else
 				{
-					io::pNode output = boost::make_shared<io::OutputTreeNode>((*it)->operator[](meta_field_name),
-						io::OutputTreeNode::STRINGS, io::OutputTreeNode::NEW_LINE);
+					// Create a set of all the matching strings to delete duplicates.
+					std::set<std::string> found_unique;
+					for (const auto& it2 : found) {
+						found_unique.insert(it2->get_str());
+					}
 
-					std::set<std::string> found = (*it)->get_found_strings();
-					for (auto it2 = found.begin() ; it2 != found.end() ; ++it2) {
-						output->append(*it2);
+					io::pNode output = boost::make_shared<io::OutputTreeNode>(it->operator[](meta_field_name),
+					io::OutputTreeNode::STRINGS, io::OutputTreeNode::NEW_LINE);
+
+					for (const auto& it2 : found_unique) {
+						output->append(it2);
 					}
 					res->add_information(output);
 				}
+			}
+
+			if (found_valid)
+			{
+				res->set_level(level);
+				res->set_summary(summary);
 			}
 		}
 
@@ -120,9 +194,10 @@ private:
 	 *	The manape_data object contains address information (entry point, sections, ...). Passing them to Yara prevents
 	 *	me from using their built in PE parser (since manalyze has already done all the work).
 	 */
-	boost::shared_ptr<manape_data> _create_manape_module_data(const mana::PE& pe)
+	static boost::shared_ptr<manape_data> _create_manape_module_data(const mana::PE& pe)
 	{
         boost::shared_ptr<manape_data> res(new manape_data, delete_manape_module_data);
+		memset(res.get(), 0, sizeof(manape_data));
         auto ioh = pe.get_image_optional_header();
         auto sections = pe.get_sections();
 
@@ -138,13 +213,14 @@ private:
         else
         {
             res->number_of_sections = sections->size();
-            res->sections = (manape_file_portion*) malloc(res->number_of_sections * sizeof(manape_file_portion));
+            res->sections = static_cast<manape_file_portion*>(malloc(res->number_of_sections * sizeof(manape_file_portion)));
             if (res->sections != nullptr)
             {
                 for (boost::uint32_t i = 0 ; i < res->number_of_sections ; ++i)
                 {
                     res->sections[i].start = sections->at(i)->get_pointer_to_raw_data();
                     res->sections[i].size = sections->at(i)->get_size_of_raw_data();
+					res->sections[i].end = res->sections[i].start + res->sections[i].size;
                 }
             }
             else
@@ -155,21 +231,41 @@ private:
             }
         }
 
-        // Add VERSION_INFO location for some ClamAV signatures
-        auto resources = pe.get_resources();
-        for (auto it = resources->begin() ; it != resources->end() ; ++it)
-        {
-            if (*(*it)->get_type() == "RT_VERSION")
-            {
-                res->version_info.start = (*it)->get_offset();
-                res->version_info.size = (*it)->get_size();
-                break;
-            }
-        }
+        // Add VERSION_INFO and MANIFEST location for some ClamAV signatures and rules
+        const auto resources = pe.get_resources();
+		if (resources != nullptr)
+		{
+			for (auto& it : *resources)
+			{
+				if (*it->get_type() == "RT_VERSION")
+				{
+					res->version_info.start = it->get_offset();
+					res->version_info.size = it->get_size();
+					res->version_info.end = res->version_info.start + res->version_info.size;
+				}
+				else if (*it->get_type() == "RT_MANIFEST")
+				{
+					res->manifest.start = it->get_offset();
+					res->manifest.size = it->get_size();
+					res->manifest.end = res->manifest.start + res->manifest.size;
+				}
+			}
+		}
+
+		// Add authenticode signature location for the findcrypt rules.
+		if (ioh)
+		{
+			res->authenticode.start = ioh->directories[IMAGE_DIRECTORY_ENTRY_SECURITY].VirtualAddress;
+			res->authenticode.size = ioh->directories[IMAGE_DIRECTORY_ENTRY_SECURITY].Size;
+			res->authenticode.end = res->authenticode.start + res->authenticode.size;
+		}
+
         return res;
 	}
 
 };
+
+// ----------------------------------------------------------------------------
 
 class ClamavPlugin : public YaraPlugin
 {
@@ -195,7 +291,7 @@ private:
 	 *
 	 *	@return	Whether the rules were loaded successfully.
 	 */
-	virtual bool _load_rules() override
+	bool _load_rules() override
 	{
 		if (!_engine.load_rules(_rule_file))
 		{
@@ -207,6 +303,8 @@ private:
 		return true;
 	}
 };
+
+// ----------------------------------------------------------------------------
 
 class CompilerDetectionPlugin : public YaraPlugin
 {
@@ -244,14 +342,33 @@ public:
 	}
 };
 
+// ----------------------------------------------------------------------------
 
 class SuspiciousStringsPlugin : public YaraPlugin
 {
 public:
 	SuspiciousStringsPlugin() : YaraPlugin("yara_rules/suspicious_strings.yara") {}
 
-	pResult analyze(const mana::PE& pe) override {
-		return scan(pe, "Strings found in the binary may indicate undesirable behavior:", SUSPICIOUS, "description", true);
+	pResult analyze(const mana::PE& pe) override 
+	{
+		auto res = scan(pe, "Strings found in the binary may indicate undesirable behavior:", SUSPICIOUS, "description", true);
+		// Scan for domain names separately as results need to be filtered out.
+		_rule_file = "yara_rules/domains.yara";
+		// Search for domain names in the PE body, but exclude irrelevant regions.
+		auto domains = scan(pe, "Interesting strings found in the binary:", NO_OPINION, "description", true, exclude_microsoft_data);
+
+		// If one of the rules didn't return anything, return the output of the other one (which may be empty too).
+		if (!res || res->is_empty()) {
+			return domains;
+		}
+		else if (!domains || domains->is_empty()) {
+			return res;
+		}
+
+		// Otherwise, merge the results.
+		res->merge(*domains);
+
+		return res;
 	}
 
 	boost::shared_ptr<std::string> get_id() const override {
@@ -263,6 +380,8 @@ public:
 	}
 };
 
+// ----------------------------------------------------------------------------
+
 class FindCryptPlugin : public YaraPlugin
 {
 public:
@@ -273,17 +392,22 @@ public:
 		pResult res = scan(pe, "Cryptographic algorithms detected in the binary:", NO_OPINION, "description");
 
 		// Look for common cryptography libraries
-		if (pe.find_imports(".*", "libssl(32)?.dll|libcrypto.dll")->size() > 0) {
-			res->add_information("Imports functions from OpenSSL.");
+		if (!pe.find_imports(".*", "libssl(32)?.dll|libcrypto.dll")->empty()) {
+			res->add_information("OpenSSL");
 		}
-		if (pe.find_imports(".*", "cryptopp.dll")->size() > 0) {
-			res->add_information("Imports functions from Crypto++");
+		if (!pe.find_imports(".*", "cryptopp.dll")->empty()) {
+			res->add_information("Crypto++");
 		}
-		if (pe.find_imports(".*", "botan.dll")->size() > 0) {
-			res->add_information("Imports functions from Botan");
+		if (!pe.find_imports(".*", "botan.dll")->empty()) {
+			res->add_information("Botan");
 		}
-		if (pe.find_imports("Crypt(.*)")->size() > 0) {
-			res->add_information("Uses Microsoft's Cryptographic API");
+		if (!pe.find_imports("Crypt(.*)")->empty()) {
+			res->add_information("Microsoft's Cryptography API");
+		}
+
+		// Set the summary if cryptographic libraries were detected.
+		if (res->get_summary() == nullptr && res->get_information()->size() > 0) {
+			res->set_summary("Libraries used to perform cryptographic operations:");
 		}
 
 		return res;
@@ -298,10 +422,53 @@ public:
 	}
 };
 
+// ----------------------------------------------------------------------------
+
+class CryptoCurrencyAddress : public YaraPlugin
+{
+public:
+	CryptoCurrencyAddress() : YaraPlugin("yara_rules/bitcoin.yara") {}
+
+	pResult analyze(const mana::PE& pe) override
+	{
+		auto btc = scan(pe, "This program may be a ransomware.", MALICIOUS, "description", true, 
+			[] (const mana::PE&, yara::Match::pSingleMatch m) { return hash::test_btc_address(m->get_str()); });
+		_rule_file = "yara_rules/monero.yara";
+		auto monero = scan(pe, "This program may be a miner.", MALICIOUS, "description", true, 
+			[] (const mana::PE&, yara::Match::pSingleMatch m) { return hash::test_xmr_address(m->get_str()); });
+
+		// If one of the plugins didn't return anything, return the output of the other one (which may be empty too).
+		if (!btc || btc->is_empty()) {
+			return monero;
+		}
+		else if (!monero || monero->is_empty()) {
+			return btc;
+		}
+
+		// Otherwise, merge the results.
+		btc->set_summary("This program contains valid cryptocurrency addresses.");
+		btc->merge(*monero);
+		return btc;
+	}
+
+	boost::shared_ptr<std::string> get_id() const override {
+		return boost::make_shared<std::string>("cryptoaddress");
+	}
+
+	boost::shared_ptr<std::string> get_description() const override {
+		return boost::make_shared<std::string>("Looks for valid BTC / XMR addresses in the binary.");
+	}
+};
+
+// ----------------------------------------------------------------------------
+// Auto-registration for built-in plugins
+// ----------------------------------------------------------------------------
+
 AutoRegister<ClamavPlugin> auto_register_clamav;
 AutoRegister<CompilerDetectionPlugin> auto_register_compiler;
 AutoRegister<PEiDPlugin> auto_register_peid;
 AutoRegister<SuspiciousStringsPlugin> auto_register_strings;
 AutoRegister<FindCryptPlugin> auto_register_findcrypt;
+AutoRegister<CryptoCurrencyAddress> auto_register_cryptoaddress;
 
 }

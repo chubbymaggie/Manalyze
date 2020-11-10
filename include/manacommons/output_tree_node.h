@@ -144,6 +144,12 @@ public:
 
 	// ----------------------------------------------------------------------------
 
+	DECLSPEC_MANACOMMONS void set_name(const std::string& name) {
+		_name->assign(name);
+	}
+
+	// ----------------------------------------------------------------------------
+
 	DECLSPEC_MANACOMMONS node_type get_type() const {
 		return _type;
 	}
@@ -201,7 +207,7 @@ public:
 	/**
 	 *	@brief	Returns the size of a LIST node.
 	 */
-	DECLSPEC_MANACOMMONS unsigned int size() const;
+	DECLSPEC_MANACOMMONS size_t size() const;
 
 	// ----------------------------------------------------------------------------
 
@@ -242,6 +248,15 @@ public:
 	*	@param	const strings& strs The strings to append.
 	*/
 	DECLSPEC_MANACOMMONS void append(const strings& strs);
+
+	// ----------------------------------------------------------------------------
+
+	/**
+	 *	@brief	Checks whether the node contains data.
+	 *
+	 *	@return	Whether the node is empty or not.
+	 */
+	DECLSPEC_MANACOMMONS bool is_empty();
 
 	// ----------------------------------------------------------------------------
 
@@ -288,6 +303,6 @@ typedef boost::shared_ptr<nodes> pNodes;
 *
 *	@return	The maximum size of the children's names.
 */
-DECLSPEC_MANACOMMONS unsigned int determine_max_width(pNode node);
+DECLSPEC_MANACOMMONS size_t determine_max_width(pNode node);
 
 } // !namespace io

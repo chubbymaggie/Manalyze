@@ -79,6 +79,21 @@ LEVEL Result::get_level() const
 
 // ----------------------------------------------------------------------------
 
+bool Result::is_empty() {
+	if (!_data || _data->is_empty()) {
+		return true;
+	}
+	if (get_summary()) {
+		return false;
+	}
+	if (get_information() && !get_information()->is_empty()) {
+		return false;
+	}
+	return true;
+}
+
+// ----------------------------------------------------------------------------
+
 void Result::set_summary(const std::string& s)
 {
 	io::pNode opt_summary = _data->find_node("summary");
@@ -116,6 +131,24 @@ io::pNode Result::get_information() const
 		_data->append(output);
 	}
 	return output;
+}
+
+// ----------------------------------------------------------------------------
+
+void Result::merge(const Result& res)
+{
+	raise_level(res.get_level());
+	auto info = res.get_information();
+	if (!info) {
+		return;
+	}
+	auto children = info->get_children();
+	if (!children) {
+		return;
+	}
+	for (auto child : *children) {
+		add_information(child);
+	}
 }
 
 // ----------------------------------------------------------------------------

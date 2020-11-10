@@ -22,9 +22,6 @@
 
 #include "manape/resources.h"
 
-namespace bfs = boost::filesystem;
-
-
 namespace mana
 {
 
@@ -36,7 +33,7 @@ bool PE::_read_image_resource_directory(image_resource_directory& dir, unsigned 
 
 	if (offset)
 	{
-		offset = _rva_to_offset(_ioh->directories[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress) + offset;
+		offset = rva_to_offset(_ioh->directories[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress) + offset;
 		if (!offset || fseek(_file_handle.get(), offset, SEEK_SET))
 		{
 			PRINT_ERROR << "Could not reach an IMAGE_RESOURCE_DIRECTORY." << DEBUG_INFO_INSIDEPE << std::endl;
@@ -50,6 +47,18 @@ bool PE::_read_image_resource_directory(image_resource_directory& dir, unsigned 
 	{
 		PRINT_ERROR << "Could not read an IMAGE_RESOURCE_DIRECTORY." << DEBUG_INFO_INSIDEPE << std::endl;
 		return false;
+	}
+
+	// Do not parse corrupted tables as it will take an extremely long time.
+	// If Characteristics is not 0 (which it should always be according to the specification) and the number of entries is
+	// unusually high, assume that the file is corrupted.
+	if (dir.NumberOfIdEntries + dir.NumberOfNamedEntries > 0x100 && dir.Characteristics != 0)
+	{
+		PRINT_ERROR << "The PE's resource section is invalid or has been manually modified. Resources will not be parsed." << DEBUG_INFO_INSIDEPE << std::endl;
+		return false;
+	}
+	else if (dir.Characteristics != 0) {
+		PRINT_WARNING << "An IMAGE_RESOURCE_DIRECTORY's characteristics should always be 0. The PE may have been manually edited." << DEBUG_INFO_INSIDEPE << std::endl;
 	}
 
 	for (auto i = 0 ; i < dir.NumberOfIdEntries + dir.NumberOfNamedEntries ; ++i)
@@ -67,13 +76,20 @@ bool PE::_read_image_resource_directory(image_resource_directory& dir, unsigned 
 		if (entry->NameOrId & 0x80000000)
 		{
 			// The offset of the string is relative
-			auto name_offset = _rva_to_offset(_ioh->directories[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress)
+			auto name_offset = rva_to_offset(_ioh->directories[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress)
 				+ (entry->NameOrId & 0x7FFFFFFF);
 			if (!name_offset || !utils::read_string_at_offset(_file_handle.get(), name_offset, entry->NameStr, true))
 			{
 				PRINT_ERROR << "Could not read an IMAGE_RESOURCE_DIRECTORY_ENTRY's name." << DEBUG_INFO_INSIDEPE << std::endl;
 				return false;
 			}
+		}
+
+		// Immediately reject obvious bogus entries.
+		if ((entry->OffsetToData & 0x7FFFFFFF) > _file_size)
+		{
+			PRINT_WARNING << "Ignored an invalid IMAGE_RESOURCE_DIRECTORY_ENTRY." << DEBUG_INFO_INSIDEPE << std::endl;
+			continue;
 		}
 
 		dir.Entries.push_back(entry);
@@ -94,19 +110,25 @@ bool PE::_parse_resources()
 	}
 
 	image_resource_directory root;
-	_read_image_resource_directory(root);
+	if (!_read_image_resource_directory(root)) {
+		return false;
+	}
 
 	// Read Type directories
 	for (std::vector<pimage_resource_directory_entry>::iterator it = root.Entries.begin() ; it != root.Entries.end() ; ++it)
 	{
 		image_resource_directory type;
-		_read_image_resource_directory(type, (*it)->OffsetToData & 0x7FFFFFFF);
+		if (! _read_image_resource_directory(type, (*it)->OffsetToData & 0x7FFFFFFF)) {
+			continue;
+		}
 
 		// Read Name directory
 		for (std::vector<pimage_resource_directory_entry>::iterator it2 = type.Entries.begin() ; it2 != type.Entries.end() ; ++it2)
 		{
 			image_resource_directory name;
-			_read_image_resource_directory(name, (*it2)->OffsetToData & 0x7FFFFFFF);
+			if (!_read_image_resource_directory(name, (*it2)->OffsetToData & 0x7FFFFFFF)) {
+				continue;
+			}
 
 			// Read the IMAGE_RESOURCE_DATA_ENTRY
 			for (std::vector<pimage_resource_directory_entry>::iterator it3 = name.Entries.begin() ; it3 != name.Entries.end() ; ++it3)
@@ -114,7 +136,7 @@ bool PE::_parse_resources()
 				image_resource_data_entry entry;
 				memset(&entry, 0, sizeof(image_resource_data_entry));
 
-				unsigned int offset = _rva_to_offset(_ioh->directories[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress + ((*it3)->OffsetToData & 0x7FFFFFFF));
+				unsigned int offset = rva_to_offset(_ioh->directories[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress + ((*it3)->OffsetToData & 0x7FFFFFFF));
 				if (!offset || fseek(_file_handle.get(), offset, SEEK_SET))
 				{
 					PRINT_ERROR << "Could not reach an IMAGE_RESOURCE_DATA_ENTRY." << DEBUG_INFO_INSIDEPE << std::endl;
@@ -127,23 +149,31 @@ bool PE::_parse_resources()
 					return false;
 				}
 
+				if (entry.Size > _file_size)
+				{
+					// TODO: Logging feature which stops spamming stderr after a message has been shown 10 times?
+					// The warning below is commented out as it tends to be displayed way too many times for offending binaries.
+					// PRINT_WARNING << "Ignored an invalid IMAGE_RESOURCE_DATA_ENTRY" << DEBUG_INFO_INSIDEPE << std::endl;
+					continue;
+				}
+
 				// Flatten the resource tree.
-				std::string name;
-				std::string type;
-				std::string language;
+				std::string r_name;
+				std::string r_type;
+				std::string r_language;
 				int id = 0;
 
 				// Translate resource type.
 				if ((*it)->NameOrId & 0x80000000) {// NameOrId is an offset to a string, we already recovered it
-					type = (*it)->NameStr;
+					r_type = (*it)->NameStr;
 				}
 				else { // Otherwise, it's a MAKERESOURCEINT constant.
-					type = *nt::translate_to_flag((*it)->NameOrId, nt::RESOURCE_TYPES);
+					r_type = *nt::translate_to_flag((*it)->NameOrId, nt::RESOURCE_TYPES);
 				}
 
 				// Translate resource name
 				if ((*it2)->NameOrId & 0x80000000) {
-					name = (*it2)->NameStr;
+					r_name = (*it2)->NameStr;
 				}
 				else {
 					id = (*it2)->NameOrId;
@@ -151,13 +181,13 @@ bool PE::_parse_resources()
 
 				// Translate the language.
 				if ((*it3)->NameOrId & 0x80000000) {
-					language = (*it3)->NameStr;
+					r_language = (*it3)->NameStr;
 				}
 				else {
-					language = *nt::translate_to_flag((*it3)->NameOrId, nt::LANG_IDS);
+					r_language = *nt::translate_to_flag((*it3)->NameOrId, nt::LANG_IDS);
 				}
 
-				offset = _rva_to_offset(entry.OffsetToData);
+				offset = rva_to_offset(entry.OffsetToData);
 				if (!offset)
 				{
 					PRINT_WARNING << "Could not locate the section containing resource " << DEBUG_INFO_INSIDEPE;
@@ -165,7 +195,7 @@ bool PE::_parse_resources()
 						std::cerr << id;
 					}
 					else {
-						std::cerr << name;
+						std::cerr << r_name;
 					}
 					std::cerr << ". Trying to use the RVA as an offset..." << DEBUG_INFO_INSIDEPE << std::endl;
 					offset = entry.OffsetToData;
@@ -173,32 +203,51 @@ bool PE::_parse_resources()
 				pResource res;
 				if (entry.Size == 0)
 				{
-					if (name != "") {
-						PRINT_WARNING << "Resource " << name << " has a size of 0!" << DEBUG_INFO_INSIDEPE << std::endl;
+					if (r_name != "") {
+						PRINT_WARNING << "Resource " << r_name << " has a size of 0!" << DEBUG_INFO_INSIDEPE << std::endl;
 					}
 					else {
 						PRINT_WARNING << "Resource " << id << " has a size of 0!" << DEBUG_INFO_INSIDEPE << std::endl;
 					}
 					continue;
 				}
-				if (name != "")
+
+				// Sanity check: verify that no resource is already pointing to the given offset.
+				bool is_malformed = false;
+				for (auto it4 = _resource_table.begin() ; it4 != _resource_table.end() ; ++it4)
 				{
-					res = boost::make_shared<Resource>(type,
-													   name,
-													   language,
+					if (*it4 != nullptr && (*it4)->get_offset() == offset && (*it4)->get_size() == entry.Size)
+					{
+						PRINT_WARNING << "The PE contains duplicate resources. It was almost certainly crafted manually." 
+									  << DEBUG_INFO_INSIDEPE << std::endl;
+						is_malformed = true;
+						break;
+					}
+				}
+				if (is_malformed) {  // Duplicate resource. Do not add it again.
+					continue;
+				}
+
+				if (r_name != "")
+				{
+					res = boost::make_shared<Resource>(r_type,
+													   r_name,
+													   r_language,
 													   entry.Codepage,
 													   entry.Size,
+													   name.TimeDateStamp,
 													   offset,
 													   _path);
 				}
 				else { // No name: call the constructor with the resource ID instead.
-					res = boost::make_shared<Resource>(type,
-													  id,
-													  language,
-													  entry.Codepage,
-													  entry.Size,
-													  offset,
-													  _path);
+					res = boost::make_shared<Resource>(r_type,
+													   id,
+													   r_language,
+													   entry.Codepage,
+													   entry.Size,
+													   name.TimeDateStamp,
+													   offset,
+													   _path);
 				}
 
 				_resource_table.push_back(res);
@@ -216,10 +265,23 @@ shared_bytes Resource::get_raw_data() const
 	auto res = boost::make_shared<std::vector<boost::uint8_t> >();
 
 	FILE* f = _reach_data();
-	unsigned int read_bytes;
+	size_t read_bytes;
 	if (f == nullptr) {
 		goto END;
 	}
+
+	// Linux doesn't throw std::bad_alloc, instead it has OOM Killer shutdown the process.
+	// This workaround prevents Manalyze from crashing by bounding how much memory can be requested.
+	#ifdef BOOST_POSIX_API
+		struct stat st;
+		stat(_path_to_pe.c_str(), &st);
+		if (_size > st.st_size)
+		{
+			PRINT_ERROR << "Resource " << *get_name() << " is bigger than the PE. Not trying to load it in memory."
+						<< DEBUG_INFO << std::endl;
+			return res;
+		}
+	#endif
 
 	try {
 		res->resize(_size);
@@ -227,8 +289,7 @@ shared_bytes Resource::get_raw_data() const
 	catch (const std::exception& e)
 	{
 		PRINT_ERROR << "Failed to allocate enough space for resource " << *get_name() << "! (" << e.what() << ")"
-			<< DEBUG_INFO << std::endl;
-		res->resize(0);
+					<< DEBUG_INFO << std::endl;
 		return res;
 	}
 	read_bytes = fread(&(*res)[0], 1, _size, f);
@@ -290,8 +351,10 @@ DECLSPEC const_shared_strings Resource::interpret_as()
 	}
 
 	// RT_STRING resources are made of 16 contiguous "unicode" strings.
-	for (int i = 0; i < 16; ++i) {
+	for (int i = 0; i < 16; ++i)
+	{
 		res->push_back(utils::read_prefixed_unicode_string(f));
+		std::vector<boost::uint8_t> utf8result;
 	}
 
 	END:
@@ -325,8 +388,15 @@ DECLSPEC pbitmap Resource::interpret_as()
 	}
 	boost::uint32_t dib_header_size = 0;
 	boost::uint32_t colors_used = 0;
+	boost::uint16_t bit_count;
 	memcpy(&dib_header_size, &(res->data[0]), sizeof(boost::uint32_t)); // DIB header size is located at offset 0.
+	memcpy(&bit_count, &(res->data[14]), sizeof(boost::uint16_t));
 	memcpy(&colors_used, &(res->data[32]), sizeof(boost::uint32_t));
+
+
+	if (colors_used == 0 && bit_count != 32 && bit_count != 24)	{
+		colors_used = 1 << bit_count;
+	}
 
 	res->OffsetToData = header_size + dib_header_size + 4*colors_used;
 	return res;
@@ -371,10 +441,10 @@ DECLSPEC pgroup_icon_directory Resource::interpret_as()
 		}
 		else // Cursors have a different structure. Adapt it to a .ico.
 		{
-			// I know I am casting bytes to shorts here. I'm not proud of it.
 			fread(&(entry->Width), 1, sizeof(boost::uint8_t), f);
 			fseek(f, 1, SEEK_CUR);
 			fread(&(entry->Height), 1, sizeof(boost::uint8_t), f);
+            entry->Height /= 2; // For some reason, twice the actual height is stored here.
 			fseek(f, 1, SEEK_CUR);
 			fread(&(entry->Planes), 1, sizeof(boost::uint16_t), f);
 			fread(&(entry->BitCount), 1, sizeof(boost::uint16_t), f);
@@ -412,7 +482,6 @@ DECLSPEC pversion_info Resource::interpret_as()
 	auto res = boost::make_shared<version_info>();
 	unsigned int bytes_read; // Is calculated by calling ftell before and after reading a structure, and keeping the difference.
 	unsigned int bytes_remaining;
-	unsigned int padding;
 	unsigned int language;
 	std::stringstream ss;
 
@@ -473,7 +542,14 @@ DECLSPEC pversion_info Resource::interpret_as()
 	// In the file, the language information is an int stored into a "unicode" string.
 	ss << std::hex << current_structure->Key;
 	ss >> language;
-	res->Language = *nt::translate_to_flag((language >> 16) & 0xFFFF, nt::LANG_IDS);
+	if (!ss.fail()) {
+		res->Language = *nt::translate_to_flag((language >> 16) & 0xFFFF, nt::LANG_IDS);
+	}
+	else
+	{
+		PRINT_WARNING << "A language ID could not be translated (" << std::hex << res->Language << ")!" << std::endl;
+		res->Language = "UNKNOWN";
+	}
 
 	bytes_read = ftell(f) - bytes_read;
 	if (current_structure->Length < bytes_read)
@@ -487,45 +563,39 @@ DECLSPEC pversion_info Resource::interpret_as()
 	// Read the StringTable
 	while (bytes_remaining > 0)
 	{
-		bytes_read = ftell(f);
+		unsigned int current_offset = ftell(f);
 		if (!parse_version_info_header(*current_structure, f))
 		{
 			res.reset();
 			goto END;
 		}
-		std::string value;
-		// If the string is null, there won't even be a null terminator.
-		if (ftell(f) - bytes_read < current_structure->Length) {
-			value = utils::read_unicode_string(f);
+
+		// Structures are aligned on DWORD boundaries, but the Length field doesn't reflect that. Update
+		// it here to facilitate the parsing.
+		if (current_structure->Length % 4 != 0) {
+			current_structure->Length += 4 - current_structure->Length % 4;
 		}
-		bytes_read = ftell(f) - bytes_read;
-		if (bytes_remaining < bytes_read)
+
+		// Only process structures that contain data.
+		if (current_structure->ValueLength != 0)
 		{
-			bytes_remaining = 0;
-			PRINT_WARNING << bytes_read - bytes_remaining << " excess bytes have been read from a StringFileInfo!"
-				<< DEBUG_INFO << std::endl;
+			std::string value;
+			if (ftell(f) - current_offset < current_structure->Length) {
+				value = utils::read_unicode_string(f);
+			}
+			// Add the key/value to our internal representation
+			auto p = boost::make_shared<string_pair>(current_structure->Key, value);
+			res->StringTable.push_back(p);
+		}
+
+		if (current_structure->Length < bytes_remaining)
+		{
+			bytes_remaining -= current_structure->Length;
+			unsigned int next_structure_offset = current_offset + current_structure->Length;
+			fseek(f, next_structure_offset, SEEK_SET);
 		}
 		else {
-			bytes_remaining -= bytes_read;
-		}
-
-		// Add the key/value to our internal representation
-		auto p = boost::make_shared<string_pair>(current_structure->Key, value);
-		res->StringTable.push_back(p);
-
-		// The next structure is 4byte aligned.
-		padding = ftell(f) % 4;
-		if (padding)
-		{
-			fseek(f, padding, SEEK_CUR);
-			// The last padding doesn't seem to be included in the length given by the structure.
-			// So if there are no more remaining bytes, don't stop here. (Otherwise, integer underflow.)
-			if (padding < bytes_remaining) {
-				bytes_remaining -= padding;
-			}
-			else {
-				bytes_remaining = 0;
-			}
+			bytes_remaining = 0;
 		}
 	}
 
@@ -578,8 +648,22 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
 		return res;
 	}
 
-	unsigned int header_size = 3 * sizeof(boost::uint16_t) + directory->Count * sizeof(group_icon_directory_entry);
-	res.resize(header_size);
+	// Sanity check.
+	if (directory->Count > resources.size())
+	{
+		PRINT_ERROR << "The number of ICON_DIRECTORY_ENTRIES is bigger than the number of resources in the file." << DEBUG_INFO << std::endl;
+		return std::vector<boost::uint8_t>();
+	}
+
+	boost::uint32_t header_size = 3 * sizeof(boost::uint16_t) + directory->Count * sizeof(group_icon_directory_entry);
+	try {
+		res.resize(header_size);
+	}
+	catch (const std::bad_alloc)
+	{
+		PRINT_ERROR << "Could not allocate enough memory to reconstruct an icon. This PE may have been manually modified." << DEBUG_INFO << std::endl;
+		return std::vector<boost::uint8_t>();
+	}
 	memcpy(&res[0], directory.get(), 3 * sizeof(boost::uint16_t));
 
 	for (int i = 0; i < directory->Count; ++i)
@@ -588,7 +672,10 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
 		pResource icon = pResource();
 		for (auto it = resources.begin(); it != resources.end(); ++it)
 		{
-			if ((*it)->get_id() == directory->Entries[i]->Id)
+            auto type = (*it)->get_type();
+            // Because there can be duplicate resource IDs, only consider the ones exhibiting the right type.
+			if ((*it)->get_id() == directory->Entries[i]->Id && type &&
+                ((*type == "RT_ICON" && directory->Type == 1) || (*type == "RT_CURSOR" && directory->Type == 2)))
 			{
 				icon = *it;
 				break;
@@ -597,8 +684,7 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
 		if (icon == nullptr)
 		{
 			PRINT_ERROR << "Could not locate RT_ICON with ID " << directory->Entries[i]->Id << "!" << DEBUG_INFO << std::endl;
-			res.clear();
-			return res;
+			return std::vector<boost::uint8_t>();
 		}
 
 		shared_bytes icon_bytes = icon->get_raw_data();
@@ -606,7 +692,7 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
 			   directory->Entries[i].get(),
 			   sizeof(group_icon_directory_entry) - sizeof(boost::uint32_t)); // Don't copy the last field.
 		// Fix the icon_directory_entry with the offset in the file instead of a RT_ICON id
-		unsigned long size_fix = res.size();
+		size_t size_fix = res.size();
 		memcpy(&res[3 * sizeof(boost::uint16_t) + (i+1) * sizeof(group_icon_directory_entry) - sizeof(boost::uint32_t)],
 			   &size_fix,
 			   sizeof(boost::uint32_t));
@@ -614,8 +700,12 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
 		if (directory->Type == 1) { // General case for icons
 			res.insert(res.end(), icon_bytes->begin(), icon_bytes->end());
 		}
-		else if (icon_bytes->size() > 2 * sizeof(boost::uint16_t)) { // Cursors have a "hotspot" structure that we have to discard to create a valid ico.
+		else if (icon_bytes->size() > 4 && directory->Entries[i]->BytesInRes > 4) // Cursors have a "hotspot" structure that we have to discard to create a valid ico.
+        {
 			res.insert(res.end(), icon_bytes->begin() + 2 * sizeof(boost::uint16_t), icon_bytes->end());
+            // Remove 4 from the size to account for this suppression
+            int new_size = directory->Entries[i]->BytesInRes - 4;
+            memcpy(&res[3 * sizeof(boost::uint16_t) + i * sizeof(group_icon_directory_entry) + 8], &new_size, 4);
 		}
 		else { // Invalid cursor.
 			res.clear();
@@ -638,6 +728,10 @@ std::vector<boost::uint8_t> reconstruct_icon(pgroup_icon_directory directory, co
  */
 bool write_data_to_file(const boost::filesystem::path& destination, std::vector<boost::uint8_t> data)
 {
+	if (data.size() == 0) {
+		return true;
+	}
+
     FILE* f = fopen(destination.string().c_str(), "wb+");
     if (f == nullptr)
     {
@@ -677,7 +771,7 @@ bool Resource::extract(const boost::filesystem::path& destination)
 
         // Copy the BMP header
         boost::shared_ptr<std::vector<boost::uint8_t> > bmp_bytes(new std::vector<boost::uint8_t>(header_size));
-        memcpy(bmp_bytes.get(), bmp.get(), header_size);
+        memcpy(&bmp_bytes->at(0), bmp.get(), header_size);
         // Copy the image bytes.
         bmp_bytes->insert(bmp_bytes->end(), bmp->data.begin(), bmp->data.end());
         data = bmp_bytes;
@@ -691,22 +785,22 @@ bool Resource::extract(const boost::filesystem::path& destination)
             return true;
         }
 
-        FILE* out = fopen(destination.string().c_str(), "w");
-        if (out == nullptr)
-        {
-            PRINT_ERROR << "Could not open/create " << destination << "!" << std::endl;
-            return false;
-        }
+		FILE* out = fopen(destination.string().c_str(), "a+");
 
-        for (auto it2 = strings->begin(); it2 != strings->end(); ++it2)
-        {
-            if ((*it2) != "")
-            {
-                fwrite(it2->c_str(), 1, it2->size(), out);
-                fputc('\n', out);
-            }
-        }
-        fclose(out);
+		if(out == nullptr) {
+			PRINT_ERROR << "Opening file " << destination.string().c_str() << " failed!" << std::endl;
+			return false;
+		}
+
+		for (auto it2 = strings->begin(); it2 != strings->end(); ++it2)
+		{
+			if (*it2 != "")
+			{
+				fwrite(it2->c_str(), it2->size(), 1, out);
+				fwrite("\n", 1, 1, out);
+			}
+		}
+		fclose(out);
         return true;
     }
     else {
@@ -727,13 +821,18 @@ bool Resource::extract(const boost::filesystem::path& destination)
 bool Resource::icon_extract(const boost::filesystem::path& destination,
                             const std::vector<pResource>& resources)
 {
-    std::vector<boost::uint8_t> data;
     if (_type != "RT_GROUP_ICON" && _type != "RT_GROUP_CURSOR")
     {
         PRINT_WARNING << "Called icon_extract on a non-icon resource!" << std::endl;
         return extract(destination);
     }
-    data = reconstruct_icon(interpret_as<pgroup_icon_directory>(), resources);
+    auto data = reconstruct_icon(interpret_as<pgroup_icon_directory>(), resources);
+	if (data.empty())
+	{
+		PRINT_WARNING << "Resource " << _id << " is empty!" << DEBUG_INFO << std::endl;
+		return true;
+	}
+
     return write_data_to_file(destination, data);
 }
 

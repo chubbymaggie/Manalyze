@@ -65,9 +65,35 @@ BOOST_AUTO_TEST_CASE(parse_testfile)
     mana::PE pe("testfiles/manatest.exe");
 	BOOST_CHECK_EQUAL(pe.get_filesize(), 16360);
 	BOOST_ASSERT(pe.is_valid());
+	BOOST_ASSERT(pe.get_path());
+	BOOST_CHECK_EQUAL(*pe.get_path(), "testfiles/manatest.exe");
 	mana::PE pe2("testfiles/manatest2.exe");
 	BOOST_CHECK_EQUAL(pe2.get_filesize(), 72704);
 	BOOST_ASSERT(pe2.is_valid());
+	BOOST_ASSERT(pe2.get_path());
+	BOOST_CHECK_EQUAL(*pe2.get_path(), "testfiles/manatest2.exe");
+}
+
+// ----------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(get_raw_bytes)
+{
+	mana::PE pe("testfiles/manatest.exe");
+	auto bytes = pe.get_raw_bytes();
+	BOOST_CHECK_EQUAL(bytes->size(), 16360);
+	BOOST_CHECK_EQUAL(bytes->at(0), 'M');
+	BOOST_CHECK_EQUAL(bytes->at(1), 'Z');
+	BOOST_CHECK_EQUAL(bytes->at(16359), '\x00');
+	BOOST_CHECK_EQUAL(bytes->at(16358), '\x00');
+	BOOST_CHECK_EQUAL(bytes->at(16357), '\x00');
+	BOOST_CHECK_EQUAL(bytes->at(16356), '\x00');
+	BOOST_CHECK_EQUAL(bytes->at(16355), '\x0B');
+	BOOST_CHECK_EQUAL(bytes->at(16354), '\x7C');
+
+	bytes = pe.get_raw_bytes(0x80);
+	BOOST_CHECK_EQUAL(bytes->size(), 0x80);
+	std::string s(&(*bytes)[0x4E], &(*bytes)[0x75]);
+	BOOST_CHECK_EQUAL(s, "This program cannot be run in DOS mode.");
 }
 
 // ----------------------------------------------------------------------------
@@ -254,6 +280,158 @@ BOOST_AUTO_TEST_CASE(parse_debug_info)
 	check_debug_directory_entry(*debug[1], "IMAGE_DEBUG_TYPE_VC_FEATURE", 20, 0x32c8, 0x18c8);
 	check_debug_directory_entry(*debug[2], "IMAGE_DEBUG_TYPE_POGO", 632, 0x32dc, 0x18dc);
 	check_debug_directory_entry(*debug[3], "IMAGE_DEBUG_TYPE_ILTCG", 0, 0, 0);
+}
+
+// ----------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(parse_config)
+{
+	mana::PE pe("testfiles/manatest.exe");
+
+	auto pconfig = pe.get_config();
+	BOOST_ASSERT(pconfig);
+	auto config = *pconfig;
+	
+	BOOST_CHECK_EQUAL(config.Size, 0x5c);
+	BOOST_CHECK_EQUAL(config.TimeDateStamp, 0);
+	BOOST_CHECK_EQUAL(config.MajorVersion, 0);
+	BOOST_CHECK_EQUAL(config.MinorVersion, 0);
+	BOOST_CHECK_EQUAL(config.GlobalFlagsClear, 0);
+	BOOST_CHECK_EQUAL(config.GlobalFlagsSet, 0);
+	BOOST_CHECK_EQUAL(config.CriticalSectionDefaultTimeout, 0);
+	BOOST_CHECK_EQUAL(config.DeCommitFreeBlockThreshold, 0);
+	BOOST_CHECK_EQUAL(config.DeCommitTotalFreeThreshold, 0);
+	BOOST_CHECK_EQUAL(config.LockPrefixTable, 0);
+	BOOST_CHECK_EQUAL(config.MaximumAllocationSize, 0);
+	BOOST_CHECK_EQUAL(config.VirtualMemoryThreshold, 0);
+	BOOST_CHECK_EQUAL(config.ProcessAffinityMask, 0);
+	BOOST_CHECK_EQUAL(config.ProcessHeapFlags, 0);
+	BOOST_CHECK_EQUAL(config.CSDVersion, 0);
+	BOOST_CHECK_EQUAL(config.Reserved1, 0);
+	BOOST_CHECK_EQUAL(config.EditList, 0);
+	BOOST_CHECK_EQUAL(config.SecurityCookie, 0x404004);
+	BOOST_CHECK_EQUAL(config.SEHandlerTable, 0x403270);
+	BOOST_CHECK_EQUAL(config.SEHandlerCount, 4);
+}
+
+// ----------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(detect_architecture)
+{
+	mana::PE pe86("testfiles/manatest.exe");
+	BOOST_CHECK(pe86.get_architecture() == mana::PE::x86);
+	mana::PE pe64("testfiles/manatest3.exe");
+	BOOST_CHECK(pe64.get_architecture() == mana::PE::x64);
+}
+
+// ----------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(parse_tls)
+{
+	mana::PE pe("testfiles/manatest3.exe");
+	auto tls = pe.get_tls();
+	BOOST_ASSERT(tls != nullptr);
+
+	BOOST_CHECK_EQUAL(tls->StartAddressOfRawData,					0x140007000);
+	BOOST_CHECK_EQUAL(tls->EndAddressOfRawData,						0x140007001);
+	BOOST_CHECK_EQUAL(tls->AddressOfIndex,							0x140005098);
+	BOOST_CHECK_EQUAL(tls->AddressOfCallbacks,						0x140003228);
+	BOOST_CHECK_EQUAL(tls->SizeOfZeroFill,							0);
+	BOOST_CHECK_EQUAL(*nt::translate_to_flag(tls->Characteristics,	nt::SECTION_CHARACTERISTICS), "IMAGE_SCN_ALIGN_1BYTES");
+	BOOST_ASSERT(tls->Callbacks.size() == 1);
+	BOOST_CHECK_EQUAL(tls->Callbacks[0],							0x140001070);
+
+	mana::PE control("testfiles/manatest.exe");
+	tls = control.get_tls();
+	BOOST_CHECK(tls == nullptr);
+}
+
+// ----------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(parse_delayed_imports)
+{
+	mana::PE pe("testfiles/manatest3.exe");
+	auto dldt = pe.get_delay_load_table();
+	BOOST_ASSERT(dldt != nullptr);
+
+	BOOST_CHECK_EQUAL(dldt->Attributes,					1);
+	BOOST_CHECK_EQUAL(dldt->NameStr,					"ADVAPI32.dll");
+	BOOST_CHECK_EQUAL(dldt->ModuleHandle,				0x5050);
+	BOOST_CHECK_EQUAL(dldt->DelayImportAddressTable,	0x5038);
+	BOOST_CHECK_EQUAL(dldt->DelayImportNameTable,		0x3ab0);
+	BOOST_CHECK_EQUAL(dldt->BoundDelayImportTable,		0x3ad8);
+	BOOST_CHECK_EQUAL(dldt->UnloadDelayImportTable,		0);
+	BOOST_CHECK_EQUAL(dldt->TimeStamp,					0);
+
+	auto delay_loaded_import = pe.find_imports("CryptAcquireContextW");
+	BOOST_ASSERT(delay_loaded_import->size() == 1);
+	BOOST_CHECK_EQUAL(delay_loaded_import->at(0), "CryptAcquireContextW");
+
+	// Also check the underlying structure. First find the corresponding ImportedLibrary object.
+	auto imports = pe.get_imports();
+	BOOST_ASSERT(imports != nullptr);
+	mana::pImportedLibrary lib;
+	for (auto it = imports->begin() ; it != imports->end() ; ++it)
+	{
+		pString s = (*it)->get_name();
+		if (s != nullptr && *s == "ADVAPI32.dll")
+		{
+			lib = *it;
+			break;
+		}
+	}
+
+	BOOST_ASSERT(lib != nullptr);
+	BOOST_CHECK_EQUAL(lib->get_type(), mana::ImportedLibrary::DELAY_LOADED);
+	BOOST_CHECK(lib->get_image_import_descriptor() == nullptr); // No image import descriptor for delay-loaded DLLs.
+	BOOST_CHECK_EQUAL(lib->get_imports()->size(), 1);
+}
+
+// ----------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(parse_overlay)
+{
+    mana::PE pe("testfiles/manatest3.exe");
+    auto overlay = pe.get_overlay_bytes();
+    BOOST_ASSERT(overlay);
+    std::string s(overlay->begin(), overlay->end());
+    BOOST_CHECK_EQUAL(s, "Overlay Bytes :)");
+
+    overlay = pe.get_overlay_bytes(8);
+    BOOST_ASSERT(overlay);
+    std::string s2(overlay->begin(), overlay->end());
+    BOOST_CHECK_EQUAL(s2, "Overlay ");
+
+    overlay = pe.get_overlay_bytes(0);
+    BOOST_ASSERT(!overlay);
+}
+
+// ----------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(parse_rich_header)
+{
+	mana::PE pe("testfiles/manatest.exe");
+	auto rich = pe.get_rich_header();
+	BOOST_ASSERT(rich != nullptr);
+	BOOST_CHECK_EQUAL(rich->xor_key, 0x374baddd);
+	BOOST_CHECK_EQUAL(rich->file_offset, 0x80);
+	BOOST_CHECK_EQUAL(rich->values.size(), 11);
+
+	BOOST_CHECK_EQUAL(std::get<0>(rich->values.at(0)),  0);
+	BOOST_CHECK_EQUAL(std::get<1>(rich->values.at(0)),  0);
+	BOOST_CHECK_EQUAL(std::get<2>(rich->values.at(0)),  0);
+	BOOST_CHECK_EQUAL(std::get<0>(rich->values.at(1)),  0x0093);
+	BOOST_CHECK_EQUAL(std::get<1>(rich->values.at(1)),  0x7809);
+	BOOST_CHECK_EQUAL(std::get<2>(rich->values.at(1)),  0xa);
+	BOOST_CHECK_EQUAL(std::get<0>(rich->values.at(2)),  0x0103);
+	BOOST_CHECK_EQUAL(std::get<1>(rich->values.at(2)),  0x5b6e);
+	BOOST_CHECK_EQUAL(std::get<2>(rich->values.at(2)),  1);
+	BOOST_CHECK_EQUAL(std::get<0>(rich->values.at(3)),  0x105);
+	BOOST_CHECK_EQUAL(std::get<1>(rich->values.at(3)),  0x5b6e);
+	BOOST_CHECK_EQUAL(std::get<2>(rich->values.at(3)),  17);
+	BOOST_CHECK_EQUAL(std::get<0>(rich->values.at(10)), 0x0102);
+	BOOST_CHECK_EQUAL(std::get<1>(rich->values.at(10)), 0x5bd2);
+	BOOST_CHECK_EQUAL(std::get<2>(rich->values.at(10)), 1);
 }
 
 // ----------------------------------------------------------------------------

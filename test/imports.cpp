@@ -90,12 +90,46 @@ BOOST_AUTO_TEST_CASE(find_imports)
 
 // ----------------------------------------------------------------------------
 
+BOOST_AUTO_TEST_CASE(find_dlls)
+{
+	mana::PE pe("testfiles/manatest.exe");
+	auto dll = pe.find_imported_dlls("Kernel32.dll");
+	BOOST_ASSERT(dll);
+	BOOST_CHECK_EQUAL(dll->size(), 1);
+
+	dll = pe.find_imported_dlls("I DON'T EXIST");
+	BOOST_ASSERT(dll);
+	BOOST_CHECK_EQUAL(dll->size(), 0);
+
+	dll = pe.find_imported_dlls(".*");
+	BOOST_ASSERT(dll);
+	BOOST_CHECK_EQUAL(dll->size(), 8);
+}
+
+// ----------------------------------------------------------------------------
+
 BOOST_AUTO_TEST_CASE(find_imports_no_match)
 {
 	mana::PE pe("testfiles/manatest.exe");
 	auto pfunctions = pe.find_imports("I DON'T EXIST");
 	BOOST_ASSERT(pfunctions);
 	BOOST_CHECK(pfunctions->size() == 0);
+}
+
+// ----------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(find_imports_case_insensitivity)
+{
+	mana::PE pe("testfiles/manatest.exe");
+	auto pfunctions = pe.find_imports("WRITEPROCESSMEMORY");
+	BOOST_ASSERT(pfunctions);
+	BOOST_ASSERT(pfunctions->size() == 1);
+	BOOST_CHECK_EQUAL(pfunctions->at(0), "WriteProcessMemory");
+
+	// Try again with case sensitivity on.
+	pfunctions = pe.find_imports("WRITEPROCESSMEMORY", ".*", true);
+	BOOST_ASSERT(pfunctions);
+	BOOST_ASSERT(pfunctions->size() == 0);
 }
 
 // ----------------------------------------------------------------------------
